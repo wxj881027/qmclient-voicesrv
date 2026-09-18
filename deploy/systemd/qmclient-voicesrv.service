@@ -1,0 +1,31 @@
+[Unit]
+Description=QmClient Voice Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=qmvoice
+Group=qmvoice
+WorkingDirectory=/opt/qmclient-voicesrv
+
+# 配置通过环境文件注入，避免把 identity-secret 写进单元文件或进程列表。
+# 前缀 "-" 表示文件缺失时仍可启动。
+# 安装建议：
+#   install -d -m 0755 /etc/qmclient
+#   install -m 0600 -o root -g root deploy/voicesrv.env.example /etc/qmclient/voicesrv.env
+#   （然后填入真实 BIND_ADDR 与 IDENTITY_SECRET，可用 openssl rand -hex 32 生成）
+EnvironmentFile=-/etc/qmclient/voicesrv.env
+
+ExecStart=/opt/qmclient-voicesrv/voicesrv --bind ${BIND_ADDR} --identity-secret ${IDENTITY_SECRET}
+Restart=always
+RestartSec=2
+
+# 收窄权限：语音服务只需要网络与只读自身二进制
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

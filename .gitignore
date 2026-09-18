@@ -1,0 +1,8 @@
+# Rust 构建产物
+/target
+**/*.rs.bk
+
+# 运行时密钥，绝不入库
+.env
+*.env
+!.env.example
