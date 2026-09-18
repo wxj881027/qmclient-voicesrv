@@ -1,0 +1,10 @@
+# 统一使用 LF：本仓库同时服务 Linux 部署与跨平台开发
+* text=auto eol=lf
+
+# 二进制文件不做换行转换
+*.png binary
+*.jpg binary
+*.ico binary
+*.ttf binary
+*.woff binary
+*.woff2 binary
