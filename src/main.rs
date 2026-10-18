@@ -1,20 +1,16 @@
 use clap::Parser;
-use flate2::{write::GzEncoder, Compression};
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::fmt;
-use std::io::{self, Write};
+use std::io;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use warp::http::{
-    header::{CONNECTION, CONTENT_ENCODING, CONTENT_TYPE, VARY},
-    HeaderValue, StatusCode,
-};
+use warp::http::{header::CONNECTION, HeaderValue, StatusCode};
 use warp::Filter;
 use warp::Reply;
 
@@ -433,16 +429,6 @@ impl SharedState {
 }
 
 #[derive(Debug, Deserialize)]
-struct TokenQuery {
-    machine_hash: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct UsersQuery {
-    server_address: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
 struct RecognitionReportRequest {
     server_address: String,
     auth_token: String,
@@ -467,31 +453,9 @@ struct RecognitionReportPlayer {
 }
 
 #[derive(Debug, Serialize)]
-struct TokenResponse {
-    auth_token: String,
-    qid: String,
-}
-
-#[derive(Debug, Serialize)]
-struct UsersResponse {
-    users: Vec<RecognitionUser>,
-}
-
-#[derive(Debug, Serialize)]
-struct ReportResponse {
-    status: &'static str,
-    qid: String,
-}
-
-#[derive(Debug, Serialize)]
 struct HealthResponse {
     status: &'static str,
     recognition_users: usize,
-}
-
-#[derive(Debug, Serialize)]
-struct ErrorResponse {
-    error: String,
 }
 
 struct VoiceServer {
@@ -721,78 +685,6 @@ fn with_shared_state(
     warp::any().map(move || shared_state.clone())
 }
 
-async fn handle_token(
-    query: TokenQuery,
-    _remote_addr: Option<SocketAddr>,
-    shared_state: Arc<Mutex<SharedState>>,
-) -> Result<impl warp::Reply, Infallible> {
-    let result = shared_state
-        .lock()
-        .map_err(|_| "shared state lock poisoned".to_string())
-        .and_then(|state| state.issue_token(&query.machine_hash));
-
-    Ok(match result {
-        Ok(qid) => json_reply(
-            StatusCode::OK,
-            &TokenResponse {
-                auth_token: qid.clone(),
-                qid,
-            },
-        ),
-        Err(error) => json_reply(StatusCode::BAD_REQUEST, &ErrorResponse { error }),
-    })
-}
-
-async fn handle_report(
-    request: RecognitionReportRequest,
-    remote_addr: Option<SocketAddr>,
-    shared_state: Arc<Mutex<SharedState>>,
-) -> Result<impl warp::Reply, Infallible> {
-    debug!(
-        "recognition report server={} players={} timestamp={:?}",
-        request.server_address,
-        request.players.len(),
-        request.timestamp
-    );
-
-    let result = shared_state
-        .lock()
-        .map_err(|_| "shared state lock poisoned".to_string())
-        .and_then(|mut state| {
-            state.apply_report(Instant::now(), request, remote_addr.map(|addr| addr.ip()))
-        });
-
-    Ok(match result {
-        Ok(qid) => json_reply(StatusCode::OK, &ReportResponse { status: "ok", qid }),
-        Err(error) => json_reply(StatusCode::BAD_REQUEST, &ErrorResponse { error }),
-    })
-}
-
-async fn handle_users(
-    query: UsersQuery,
-    accept_encoding: Option<String>,
-    shared_state: Arc<Mutex<SharedState>>,
-) -> Result<impl warp::Reply, Infallible> {
-    let result = shared_state
-        .lock()
-        .map_err(|_| "shared state lock poisoned".to_string())
-        .map(|mut state| {
-            let users = state.users(Instant::now(), query.server_address.as_deref());
-            UsersResponse { users }
-        });
-
-    Ok(match result {
-        Ok(response) => {
-            json_reply_with_encoding(StatusCode::OK, &response, accept_encoding.as_deref())
-        }
-        Err(error) => json_reply_with_encoding(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &ErrorResponse { error },
-            accept_encoding.as_deref(),
-        ),
-    })
-}
-
 async fn handle_health(
     shared_state: Arc<Mutex<SharedState>>,
 ) -> Result<impl warp::Reply, Infallible> {
@@ -813,43 +705,22 @@ async fn handle_health(
 fn http_routes(
     shared_state: Arc<Mutex<SharedState>>,
 ) -> impl Filter<Extract = (impl Reply,), Error = warp::Rejection> + Clone {
-    let token_route = warp::path("qm")
-        .and(warp::path("token"))
+    // 旧 HTTP 识别接口不再公开，识别同步仅使用回环 WebSocket。
+    warp::path("healthz")
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::query::<TokenQuery>())
+        // 健康状态只供本机监控读取，公网请求不返回 JSON。
         .and(warp::addr::remote())
-        .and(with_shared_state(shared_state.clone()))
-        .and_then(handle_token);
-
-    let report_route = warp::path("qm")
-        .and(warp::path("report"))
-        .and(warp::path::end())
-        .and(warp::post())
-        .and(warp::body::json())
-        .and(warp::addr::remote())
-        .and(with_shared_state(shared_state.clone()))
-        .and_then(handle_report);
-
-    let users_route = warp::path("qm")
-        .and(warp::path("users.json"))
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(warp::query::<UsersQuery>())
-        .and(warp::header::optional::<String>("accept-encoding"))
-        .and(with_shared_state(shared_state.clone()))
-        .and_then(handle_users);
-
-    let health_route = warp::path("healthz")
-        .and(warp::path::end())
-        .and(warp::get())
+        .and_then(|remote: Option<SocketAddr>| async move {
+            if remote.is_some_and(|address| address.ip().is_loopback()) {
+                Ok(())
+            } else {
+                Err(warp::reject::not_found())
+            }
+        })
+        .untuple_one()
         .and(with_shared_state(shared_state))
-        .and_then(handle_health);
-
-    token_route
-        .or(report_route)
-        .or(users_route)
-        .or(health_route)
+        .and_then(handle_health)
 }
 
 fn start_http_server(bind: SocketAddr, shared_state: Arc<Mutex<SharedState>>) {
@@ -873,65 +744,6 @@ fn json_reply<T: Serialize>(status: StatusCode, value: &T) -> warp::reply::Respo
         .headers_mut()
         .insert(CONNECTION, HeaderValue::from_static("close"));
     response
-}
-
-fn json_reply_with_encoding<T: Serialize>(
-    status: StatusCode,
-    value: &T,
-    accept_encoding: Option<&str>,
-) -> warp::reply::Response {
-    if !accepts_gzip(accept_encoding) {
-        let mut response = json_reply(status, value);
-        response
-            .headers_mut()
-            .insert(VARY, HeaderValue::from_static("accept-encoding"));
-        return response;
-    }
-
-    let json = serde_json::to_vec(value).expect("JSON response serialization failed");
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
-    encoder
-        .write_all(&json)
-        .expect("gzip response compression failed");
-    let compressed = encoder.finish().expect("gzip response finalization failed");
-    let mut response = warp::reply::Response::new(compressed.into());
-    *response.status_mut() = status;
-    response
-        .headers_mut()
-        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    response
-        .headers_mut()
-        .insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
-    response
-        .headers_mut()
-        .insert(VARY, HeaderValue::from_static("accept-encoding"));
-    response
-        .headers_mut()
-        .insert(CONNECTION, HeaderValue::from_static("close"));
-    response
-}
-
-fn accepts_gzip(accept_encoding: Option<&str>) -> bool {
-    let Some(accept_encoding) = accept_encoding else {
-        return false;
-    };
-
-    accept_encoding.split(',').any(|value| {
-        let mut parts = value.trim().split(';');
-        if !parts
-            .next()
-            .is_some_and(|encoding| encoding.trim().eq_ignore_ascii_case("gzip"))
-        {
-            return false;
-        }
-        !parts.any(|parameter| {
-            parameter
-                .trim()
-                .strip_prefix("q=")
-                .and_then(|quality| quality.parse::<f32>().ok())
-                .is_some_and(|quality| quality == 0.0)
-        })
-    })
 }
 
 fn normalize_machine_hash(machine_hash: &str) -> Result<String, String> {
@@ -1187,7 +999,7 @@ mod tests {
     }
 
     #[test]
-    fn users_response_is_compressed_and_closes_the_connection() {
+    fn public_http_requests_do_not_return_identity_or_health_data() {
         let state = Arc::new(Mutex::new(SharedState::new(
             "secret".to_string(),
             Duration::from_secs(60),
@@ -1198,29 +1010,28 @@ mod tests {
             .enable_time()
             .build()
             .expect("test runtime");
-
-        let response = runtime.block_on(
+        for (method, path) in [
+            ("GET", "/qm/token?machine_hash=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+            ("POST", "/qm/report"),
+            ("GET", "/qm/users.json"),
+            ("GET", "/healthz"),
+        ] {
+            let response = runtime.block_on(
+                warp::test::request()
+                    .method(method)
+                    .path(path)
+                    .remote_addr(([192, 0, 2, 1], 12345).into())
+                    .reply(&routes),
+            );
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {path}");
+        }
+        let health = runtime.block_on(
             warp::test::request()
                 .method("GET")
-                .path("/qm/users.json")
-                .header("accept-encoding", "deflate, gzip")
+                .path("/healthz")
+                .remote_addr(([127, 0, 0, 1], 12345).into())
                 .reply(&routes),
         );
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers()["content-encoding"], "gzip");
-        assert_eq!(response.headers()["connection"], "close");
-
-        let plain_response = runtime.block_on(
-            warp::test::request()
-                .method("GET")
-                .path("/qm/users.json")
-                .reply(&routes),
-        );
-
-        assert_eq!(plain_response.status(), StatusCode::OK);
-        assert!(plain_response.headers().get("content-encoding").is_none());
-        assert_eq!(plain_response.headers()["connection"], "close");
-        assert_eq!(plain_response.body(), r#"{"users":[]}"#);
+        assert_eq!(health.status(), StatusCode::OK);
     }
 }

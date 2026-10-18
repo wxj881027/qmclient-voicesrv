@@ -10,7 +10,6 @@ license = "Zlib"
 [dependencies]
 clap = { version = "4.5.38", features = ["derive"] }
 env_logger = "0.11.8"
-flate2 = "1.1.9"
 futures-util = { version = "0.3", features = ["sink"] }
 log = "0.4.27"
 serde = { version = "1.0.228", features = ["derive"] }
